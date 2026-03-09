@@ -3,11 +3,16 @@ name: Morning Stock Screener
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 23 * * *"
+    # 平日朝8:00 JST = 前日23:00 UTC
+    - cron: "0 23 * * 0-4"
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TZ: Asia/Tokyo
 
     steps:
       - name: Checkout repository
@@ -23,6 +28,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas yfinance
 
+      - name: Set run date (JST)
+        run: |
+          echo "RUN_DATE=$(date +%F)" >> $GITHUB_ENV
+
       - name: Run screener
         run: |
           python screener.py
@@ -30,9 +39,10 @@ jobs:
       - name: Upload result CSV files
         uses: actions/upload-artifact@v4
         with:
-          name: screener-results
+          name: screener-results-${{ env.RUN_DATE }}
           path: |
             large_caps.csv
             mid_caps.csv
             low_price.csv
             morning_watchlist.csv
+            history/*.csv
