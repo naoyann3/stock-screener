@@ -8,10 +8,8 @@ MAX_TICKERS = 500
 BATCH_SIZE = 100
 SLEEP_SEC = 0.8
 
-# 売買代金フィルター（円）
+# フィルター
 MIN_TURNOVER = 50_000_000   # 5000万円
-
-# 出来高の絶対値フィルター（株）
 MIN_VOLUME = 200_000        # 20万株
 
 
@@ -24,7 +22,7 @@ def load_tickers(csv_path=TICKERS_CSV, max_tickers=MAX_TICKERS):
     return df.head(max_tickers).copy()
 
 
-def fetch_data(ticker, period="3mo", interval="1d"):
+def fetch_data(ticker, period="6mo", interval="1d"):
     try:
         df = yf.download(
             ticker,
@@ -35,7 +33,7 @@ def fetch_data(ticker, period="3mo", interval="1d"):
             threads=False,
         )
 
-        if df is None or df.empty or len(df) < 30:
+        if df is None or df.empty or len(df) < 40:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -49,7 +47,7 @@ def fetch_data(ticker, period="3mo", interval="1d"):
         df = df[need_cols].copy()
         df = df.dropna()
 
-        if len(df) < 30:
+        if len(df) < 40:
             return None
 
         return df
@@ -67,6 +65,8 @@ def calc_indicators(df):
 
     # 出来高平均
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
+    df["vol_avg10"] = df["Volume"].rolling(10).mean()
+    df["vol_avg3"] = df["Volume"].rolling(3).mean()
 
     # 出来高倍率
     df["volume_ratio"] = df["Volume"] / df["vol_avg20"]
@@ -82,6 +82,10 @@ def calc_indicators(df):
     # 前日終値比
     df["prev_close"] = df["Close"].shift(1)
     df["prev_change_pct"] = (df["Close"] - df["prev_close"]) / df["prev_close"] * 100
+
+    # 5日騰落率
+    df["close_5ago"] = df["Close"].shift(5)
+    df["change_5d_pct"] = (df["Close"] - df["close_5ago"]) / df["close_5ago"] * 100
 
     # 当日値幅率
     df["day_range_pct"] = (df["High"] - df["Low"]) / df["Low"] * 100
@@ -99,7 +103,7 @@ def calc_indicators(df):
         (df["recent_high_20"] - df["Close"]) / df["Close"] * 100
     )
 
-    # 直近5日高値（短期ブレイク確認用）
+    # 直近5日高値
     df["recent_high_5"] = df["High"].rolling(5).max()
 
     # 5日高値までの距離
@@ -113,6 +117,38 @@ def calc_indicators(df):
     # 売買代金
     df["turnover"] = df["Close"] * df["Volume"]
     df["turnover_million"] = df["turnover"] / 1_000_000
+
+    # ===== 新ロジック =====
+
+    # 決算前資金流入っぽい動き
+    # 直近3日平均出来高 > 20日平均出来高
+    df["event_volume_flag"] = (df["vol_avg3"] > df["vol_avg20"]).astype(int)
+
+    # 5日騰落率が +5%〜+20% の範囲
+    df["event_price_flag"] = (
+        (df["change_5d_pct"] >= 5) & (df["change_5d_pct"] <= 20)
+    ).astype(int)
+
+    # 決算前っぽい資金流入（推定）
+    df["event_pre_earnings_like"] = (
+        (df["event_volume_flag"] == 1) & (df["event_price_flag"] == 1)
+    ).astype(int)
+
+    # 吸収型上昇（出来高は増えているのに価格変動は小さい）
+    # → 大口が静かに拾っている可能性
+    df["smart_money_absorb"] = (
+        (df["volume_ratio"] >= 3.0) &
+        (df["prev_change_pct"].abs() <= 3.0) &
+        (df["day_range_pct"] <= 6.0)
+    ).astype(int)
+
+    # 緩め版スマートマネー
+    df["smart_money_absorb_loose"] = (
+        (df["vol_accel_3"] >= 1.8) &
+        (df["change_5d_pct"] >= 0) &
+        (df["change_5d_pct"] <= 8) &
+        (df["day_range_pct"] <= 8)
+    ).astype(int)
 
     return df
 
@@ -148,6 +184,13 @@ def score_row(row, category):
     elif prev_chg > 15:
         score += max(0, 15 * 0.5 - (prev_chg - 15) * 0.7)
 
+    # 5日騰落率
+    chg5 = row.get("change_5d_pct", 0)
+    if 3 <= chg5 <= 20:
+        score += 2.0
+    elif chg5 > 25:
+        score -= 1.5
+
     # 引け位置
     close_pos = row.get("close_position_pct", 0)
     if close_pos >= 70:
@@ -168,10 +211,10 @@ def score_row(row, category):
     if row.get("resistance_gap_pct", 999) <= 5:
         score += 1.5
 
-    # 5日高値ブレイク直前なら加点
+    # 5日高値ブレイク直前
     score += row.get("near_breakout_5", 0) * 2.0
 
-    # 売買代金の加点
+    # 売買代金
     turnover_m = row.get("turnover_million", 0)
     if turnover_m >= 1000:        # 10億円以上
         score += 2.5
@@ -179,6 +222,15 @@ def score_row(row, category):
         score += 1.5
     elif turnover_m >= 100:       # 1億円以上
         score += 0.8
+
+    # ===== 新ロジック加点 =====
+
+    # 決算前っぽい資金流入
+    score += row.get("event_pre_earnings_like", 0) * 2.5
+
+    # スマートマネー吸収型
+    score += row.get("smart_money_absorb", 0) * 3.0
+    score += row.get("smart_money_absorb_loose", 0) * 1.5
 
     # カテゴリ補正
     if category == "low":
@@ -198,10 +250,13 @@ def build_row_data(ticker, name, latest):
         "ma25": round(float(latest["ma25"]), 3),
         "volume": int(latest["Volume"]),
         "vol_avg20": round(float(latest["vol_avg20"]), 3),
+        "vol_avg10": round(float(latest["vol_avg10"]), 3),
+        "vol_avg3": round(float(latest["vol_avg3"]), 3),
         "volume_ratio": round(float(latest["volume_ratio"]), 6),
         "vol_accel_3": round(float(latest["vol_accel_3"]), 6),
         "ma5_gap_pct": round(float(latest["ma5_gap_pct"]), 6),
         "prev_change_pct": round(float(latest["prev_change_pct"]), 6),
+        "change_5d_pct": round(float(latest["change_5d_pct"]), 6),
         "day_range_pct": round(float(latest["day_range_pct"]), 6),
         "close_position_pct": round(float(latest["close_position_pct"]), 6),
         "recent_high_20": round(float(latest["recent_high_20"]), 3),
@@ -211,6 +266,9 @@ def build_row_data(ticker, name, latest):
         "near_breakout_5": int(latest["near_breakout_5"]),
         "turnover": round(float(latest["turnover"]), 0),
         "turnover_million": round(float(latest["turnover_million"]), 3),
+        "event_pre_earnings_like": int(latest["event_pre_earnings_like"]),
+        "smart_money_absorb": int(latest["smart_money_absorb"]),
+        "smart_money_absorb_loose": int(latest["smart_money_absorb_loose"]),
     }
 
 
@@ -241,11 +299,16 @@ def run():
             latest = hist.iloc[-1]
 
             required_cols = [
-                "ma5", "ma25", "vol_avg20", "volume_ratio", "vol_accel_3",
-                "ma5_gap_pct", "prev_change_pct", "day_range_pct",
-                "close_position_pct", "recent_high_20", "resistance_gap_pct",
+                "ma5", "ma25", "vol_avg20", "vol_avg10", "vol_avg3",
+                "volume_ratio", "vol_accel_3",
+                "ma5_gap_pct", "prev_change_pct", "change_5d_pct",
+                "day_range_pct", "close_position_pct",
+                "recent_high_20", "resistance_gap_pct",
                 "recent_high_5", "breakout_gap_pct_5", "near_breakout_5",
-                "turnover", "turnover_million"
+                "turnover", "turnover_million",
+                "event_pre_earnings_like",
+                "smart_money_absorb",
+                "smart_money_absorb_loose",
             ]
             if latest[required_cols].isna().any():
                 continue
@@ -297,6 +360,7 @@ def run():
         "volume_ratio",
         "vol_accel_3",
         "prev_change_pct",
+        "change_5d_pct",
         "ma5_gap_pct",
         "day_range_pct",
         "close_position_pct",
@@ -305,6 +369,9 @@ def run():
         "recent_high_5",
         "breakout_gap_pct_5",
         "near_breakout_5",
+        "event_pre_earnings_like",
+        "smart_money_absorb",
+        "smart_money_absorb_loose",
     ]
 
     print("\n==== 大型テーマ株（上位10件）====")
