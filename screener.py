@@ -172,6 +172,7 @@ def score_row(row, category):
 def build_row_data(ticker, name, latest):
     row_data = {
         "ticker": ticker,
+        "name": name,
         "close": round(float(latest["Close"]), 3),
         "ma5": round(float(latest["ma5"]), 3),
         "ma25": round(float(latest["ma25"]), 3),
@@ -188,7 +189,6 @@ def build_row_data(ticker, name, latest):
         "recent_high_5": round(float(latest["recent_high_5"]), 3),
         "breakout_gap_pct_5": round(float(latest["breakout_gap_pct_5"]), 6),
         "near_breakout_5": int(latest["near_breakout_5"]),
-        "name": name,
     }
     return row_data
 
