@@ -3,8 +3,8 @@ name: Morning Stock Screener
 on:
   workflow_dispatch:
   schedule:
-    # 平日朝8:00 JST = 前日23:00 UTC
-    - cron: "0 23 * * 0-4"
+    # 平日夜20:00 JST = 11:00 UTC
+    - cron: "0 11 * * 1-5"
 
 jobs:
   run-screener:
