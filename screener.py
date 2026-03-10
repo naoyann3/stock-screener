@@ -11,8 +11,6 @@ SLEEP_SEC = 0.8
 # 実戦用フィルター
 MIN_TURNOVER = 50_000_000   # 5000万円
 MIN_VOLUME = 200_000        # 20万株
-
-# 監視上位に残したい最低限の引け位置
 MIN_CLOSE_POSITION_FOR_WATCH = 35.0
 
 
@@ -77,7 +75,7 @@ def calc_indicators(df):
     # 出来高倍率
     df["volume_ratio"] = df["Volume"] / df["vol_avg20"]
 
-    # 出来高加速（直近3日平均 ÷ その前3日平均）
+    # 出来高加速
     recent3 = df["Volume"].rolling(3).mean()
     prev3 = recent3.shift(3)
     df["vol_accel_3"] = recent3 / prev3
@@ -103,21 +101,15 @@ def calc_indicators(df):
 
     # 直近20日高値
     df["recent_high_20"] = df["High"].rolling(20).max()
-
-    # 上値余地
     df["resistance_gap_pct"] = (
         (df["recent_high_20"] - df["Close"]) / df["Close"] * 100
     )
 
     # 直近5日高値
     df["recent_high_5"] = df["High"].rolling(5).max()
-
-    # 5日高値までの距離
     df["breakout_gap_pct_5"] = (
         (df["recent_high_5"] - df["Close"]) / df["Close"] * 100
     )
-
-    # 5日高値にかなり近いか（2%以内）
     df["near_breakout_5"] = (df["breakout_gap_pct_5"] <= 2.0).astype(int)
 
     # 売買代金
@@ -133,14 +125,13 @@ def calc_indicators(df):
         (df["event_volume_flag"] == 1) & (df["event_price_flag"] == 1)
     ).astype(int)
 
-    # 吸収型上昇（大口が静かに拾う形）
+    # 吸収型上昇
     df["smart_money_absorb"] = (
         (df["volume_ratio"] >= 3.0) &
         (df["prev_change_pct"].abs() <= 3.0) &
         (df["day_range_pct"] <= 6.0)
     ).astype(int)
 
-    # 緩め版
     df["smart_money_absorb_loose"] = (
         (df["vol_accel_3"] >= 1.8) &
         (df["change_5d_pct"] >= 0) &
@@ -148,7 +139,7 @@ def calc_indicators(df):
         (df["day_range_pct"] <= 8)
     ).astype(int)
 
-    # センターピンに近い強シグナル
+    # コアシグナル（フラグとしては残す）
     df["core_signal"] = (
         (df["volume_ratio"] >= 1.8) &
         (df["vol_accel_3"] >= 1.3) &
@@ -188,7 +179,7 @@ def score_row(row, category):
     if row.get("resistance_gap_pct", 999) <= 5:
         score += 1.8
 
-    # 引け位置（最重要補助）
+    # 引け位置
     close_pos = row.get("close_position_pct", 0)
     if close_pos >= 80:
         score += 3.0
@@ -239,11 +230,13 @@ def score_row(row, category):
 
     # 売買代金
     turnover_m = row.get("turnover_million", 0)
-    if turnover_m >= 1000:        # 10億円以上
-        score += 2.5
-    elif turnover_m >= 300:       # 3億円以上
-        score += 1.5
-    elif turnover_m >= 100:       # 1億円以上
+    if turnover_m >= 2000:
+        score += 4.0
+    elif turnover_m >= 1000:
+        score += 3.0
+    elif turnover_m >= 500:
+        score += 2.0
+    elif turnover_m >= 100:
         score += 0.8
 
     # 決算前・イベント前っぽい
@@ -253,8 +246,8 @@ def score_row(row, category):
     score += row.get("smart_money_absorb", 0) * 2.2
     score += row.get("smart_money_absorb_loose", 0) * 1.0
 
-    # コアシグナル
-    score += row.get("core_signal", 0) * 3.0
+    # core_signal は弱める（前回は強すぎた）
+    score += row.get("core_signal", 0) * 0.8
 
     # カテゴリ補正
     if category == "low":
@@ -297,6 +290,45 @@ def build_row_data(ticker, name, latest):
         "smart_money_absorb_loose": int(latest["smart_money_absorb_loose"]),
         "core_signal": int(latest["core_signal"]),
     }
+
+
+def add_entry_priority(df):
+    """
+    バックテスト結果を反映した最終エントリー優先順位を作る。
+    rank1を少し下げ、rank2〜5を優遇する。
+    """
+    if df.empty:
+        return df
+
+    out = df.copy().reset_index(drop=True)
+    out["raw_rank"] = range(1, len(out) + 1)
+    out["entry_priority_score"] = out["score"]
+
+    # rank補正
+    out.loc[out["raw_rank"] == 1, "entry_priority_score"] -= 2.0
+    out.loc[out["raw_rank"] == 2, "entry_priority_score"] += 2.0
+    out.loc[out["raw_rank"] == 3, "entry_priority_score"] += 1.5
+    out.loc[out["raw_rank"].between(4, 5), "entry_priority_score"] += 1.0
+    out.loc[out["raw_rank"].between(6, 10), "entry_priority_score"] -= 0.3
+
+    # core_signal は強すぎると遅い可能性があるので少し減点
+    out.loc[out["core_signal"] == 1, "entry_priority_score"] -= 0.8
+
+    # ただし near_breakout + 引け強い は再加点
+    mask_good_shape = (
+        (out["near_breakout_5"] == 1) &
+        (out["close_position_pct"] >= 60)
+    )
+    out.loc[mask_good_shape, "entry_priority_score"] += 1.0
+
+    # event系は少し加点
+    out.loc[out["event_pre_earnings_like"] == 1, "entry_priority_score"] += 0.5
+
+    out["entry_priority_score"] = out["entry_priority_score"].round(2)
+    out = out.sort_values("entry_priority_score", ascending=False).reset_index(drop=True)
+    out["entry_rank"] = range(1, len(out) + 1)
+
+    return out
 
 
 def run():
@@ -344,10 +376,8 @@ def run():
 
             row_data = build_row_data(ticker, name, latest)
 
-            # 実戦フィルター
             if row_data["turnover"] < MIN_TURNOVER:
                 continue
-
             if row_data["volume"] < MIN_VOLUME:
                 continue
 
@@ -430,21 +460,30 @@ def run():
         all_watch = all_watch.sort_values("score", ascending=False)
         morning_watch = all_watch.drop_duplicates(subset=["ticker"], keep="first").copy()
 
-        # 引けが弱すぎるものを監視上位から落としやすくする
+        # 引けが弱すぎるものは除外
         morning_watch = morning_watch[
             morning_watch["close_position_pct"] >= MIN_CLOSE_POSITION_FOR_WATCH
         ].copy()
 
+        # 元スコア順位
+        morning_watch = morning_watch.sort_values("score", ascending=False).reset_index(drop=True)
+        morning_watch["raw_rank"] = range(1, len(morning_watch) + 1)
+
+        # バックテスト反映の再優先付け
+        morning_watch = add_entry_priority(morning_watch)
+
+        # 上位10件
         morning_watch = morning_watch.head(10)
 
-        print("\n==== 朝の監視ランキング（重複除外）====")
-        if not morning_watch.empty:
-            print(morning_watch[display_cols].to_string(index=False))
-        else:
-            print("該当なし")
+        print("\n==== 朝の監視ランキング（改良版・重複除外）====")
+        print(
+            morning_watch[
+                display_cols + ["raw_rank", "entry_priority_score", "entry_rank"]
+            ].to_string(index=False)
+        )
     else:
-        morning_watch = pd.DataFrame(columns=display_cols)
-        print("\n==== 朝の監視ランキング（重複除外）====")
+        morning_watch = pd.DataFrame(columns=display_cols + ["raw_rank", "entry_priority_score", "entry_rank"])
+        print("\n==== 朝の監視ランキング（改良版・重複除外）====")
         print("該当なし")
 
     # CSV
