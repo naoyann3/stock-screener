@@ -258,6 +258,7 @@ def run():
 
     display_cols = [
         "ticker",
+        "name",
         "close",
         "ma5",
         "ma25",
@@ -274,7 +275,6 @@ def run():
         "recent_high_5",
         "breakout_gap_pct_5",
         "near_breakout_5",
-        "name",
         "category",
         "score",
     ]
