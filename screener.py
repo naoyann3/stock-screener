@@ -8,6 +8,10 @@ MAX_TICKERS = 500
 BATCH_SIZE = 100
 SLEEP_SEC = 0.8
 
+# 売買代金フィルター（円）
+# まずは緩めに 50,000,000 = 5000万円
+MIN_TURNOVER = 50_000_000
+
 
 def load_tickers(csv_path=TICKERS_CSV, max_tickers=MAX_TICKERS):
     df = pd.read_csv(csv_path)
@@ -31,7 +35,6 @@ def fetch_data(ticker, period="3mo", interval="1d"):
         if df is None or df.empty or len(df) < 30:
             return None
 
-        # MultiIndex対策
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -91,8 +94,7 @@ def calc_indicators(df):
         (df["recent_high_20"] - df["Close"]) / df["Close"] * 100
     )
 
-    # ===== 追加部分：直近5日高値ブレイク判定 =====
-    # 直近5日高値（当日含む）
+    # 直近5日高値（短期ブレイク確認用）
     df["recent_high_5"] = df["High"].rolling(5).max()
 
     # 5日高値までの距離
@@ -102,6 +104,10 @@ def calc_indicators(df):
 
     # 5日高値にかなり近いか（2%以内なら1）
     df["near_breakout_5"] = (df["breakout_gap_pct_5"] <= 2.0).astype(int)
+
+    # 売買代金
+    df["turnover"] = df["Close"] * df["Volume"]
+    df["turnover_million"] = df["turnover"] / 1_000_000
 
     return df
 
@@ -123,7 +129,7 @@ def score_row(row, category):
     score += min(row.get("volume_ratio", 0), 10) * 2.0
     score += min(row.get("vol_accel_3", 0), 5) * 1.5
 
-    # トレンド系
+    # 5日線乖離
     ma5_gap = row.get("ma5_gap_pct", 0)
     if 0 <= ma5_gap <= 15:
         score += ma5_gap * 0.6
@@ -146,7 +152,7 @@ def score_row(row, category):
     else:
         score -= 1.0
 
-    # 当日値幅
+    # 値幅
     day_range = row.get("day_range_pct", 0)
     if 3 <= day_range <= 12:
         score += 1.5
@@ -157,8 +163,17 @@ def score_row(row, category):
     if row.get("resistance_gap_pct", 999) <= 5:
         score += 1.5
 
-    # ===== 追加部分：5日高値ブレイク直前 =====
+    # 5日高値ブレイク直前なら加点
     score += row.get("near_breakout_5", 0) * 2.0
+
+    # 売買代金の加点
+    turnover_m = row.get("turnover_million", 0)
+    if turnover_m >= 1000:        # 10億円以上
+        score += 2.5
+    elif turnover_m >= 300:       # 3億円以上
+        score += 1.5
+    elif turnover_m >= 100:       # 1億円以上
+        score += 0.8
 
     # カテゴリ補正
     if category == "low":
@@ -170,7 +185,7 @@ def score_row(row, category):
 
 
 def build_row_data(ticker, name, latest):
-    row_data = {
+    return {
         "ticker": ticker,
         "name": name,
         "close": round(float(latest["Close"]), 3),
@@ -189,8 +204,9 @@ def build_row_data(ticker, name, latest):
         "recent_high_5": round(float(latest["recent_high_5"]), 3),
         "breakout_gap_pct_5": round(float(latest["breakout_gap_pct_5"]), 6),
         "near_breakout_5": int(latest["near_breakout_5"]),
+        "turnover": round(float(latest["turnover"]), 0),
+        "turnover_million": round(float(latest["turnover_million"]), 3),
     }
-    return row_data
 
 
 def run():
@@ -219,17 +235,22 @@ def run():
             hist = calc_indicators(hist)
             latest = hist.iloc[-1]
 
-            # 必須指標がNaNならスキップ
             required_cols = [
                 "ma5", "ma25", "vol_avg20", "volume_ratio", "vol_accel_3",
                 "ma5_gap_pct", "prev_change_pct", "day_range_pct",
                 "close_position_pct", "recent_high_20", "resistance_gap_pct",
-                "recent_high_5", "breakout_gap_pct_5", "near_breakout_5"
+                "recent_high_5", "breakout_gap_pct_5", "near_breakout_5",
+                "turnover", "turnover_million"
             ]
             if latest[required_cols].isna().any():
                 continue
 
             row_data = build_row_data(ticker, name, latest)
+
+            # 売買代金フィルター
+            if row_data["turnover"] < MIN_TURNOVER:
+                continue
+
             is_large, is_mid, is_low = classify_row(row_data)
 
             if is_large:
@@ -252,22 +273,22 @@ def run():
 
             time.sleep(SLEEP_SEC)
 
-    large_df = pd.DataFrame(large_rows).sort_values("score", ascending=False)
-    mid_df = pd.DataFrame(mid_rows).sort_values("score", ascending=False)
-    low_df = pd.DataFrame(low_rows).sort_values("score", ascending=False)
+    large_df = pd.DataFrame(large_rows).sort_values("score", ascending=False) if large_rows else pd.DataFrame()
+    mid_df = pd.DataFrame(mid_rows).sort_values("score", ascending=False) if mid_rows else pd.DataFrame()
+    low_df = pd.DataFrame(low_rows).sort_values("score", ascending=False) if low_rows else pd.DataFrame()
 
     display_cols = [
         "ticker",
         "name",
+        "category",
+        "score",
         "close",
-        "ma5",
-        "ma25",
         "volume",
-        "vol_avg20",
+        "turnover_million",
         "volume_ratio",
         "vol_accel_3",
-        "ma5_gap_pct",
         "prev_change_pct",
+        "ma5_gap_pct",
         "day_range_pct",
         "close_position_pct",
         "recent_high_20",
@@ -275,8 +296,6 @@ def run():
         "recent_high_5",
         "breakout_gap_pct_5",
         "near_breakout_5",
-        "category",
-        "score",
     ]
 
     print("\n==== 大型テーマ株（上位10件）====")
@@ -298,7 +317,10 @@ def run():
         print("該当なし")
 
     # 朝の監視ランキング（重複除外）
-    all_watch = pd.concat([large_df, mid_df, low_df], ignore_index=True)
+    all_watch = pd.concat([large_df, mid_df, low_df], ignore_index=True) if (
+        not large_df.empty or not mid_df.empty or not low_df.empty
+    ) else pd.DataFrame()
+
     if not all_watch.empty:
         all_watch = all_watch.sort_values("score", ascending=False)
         morning_watch = all_watch.drop_duplicates(subset=["ticker"], keep="first")
@@ -312,9 +334,21 @@ def run():
         print("該当なし")
 
     # CSV出力
-    large_df.to_csv("large_caps.csv", index=False, encoding="utf-8-sig")
-    mid_df.to_csv("mid_caps.csv", index=False, encoding="utf-8-sig")
-    low_df.to_csv("low_price.csv", index=False, encoding="utf-8-sig")
+    if not large_df.empty:
+        large_df.to_csv("large_caps.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame(columns=display_cols).to_csv("large_caps.csv", index=False, encoding="utf-8-sig")
+
+    if not mid_df.empty:
+        mid_df.to_csv("mid_caps.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame(columns=display_cols).to_csv("mid_caps.csv", index=False, encoding="utf-8-sig")
+
+    if not low_df.empty:
+        low_df.to_csv("low_price.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame(columns=display_cols).to_csv("low_price.csv", index=False, encoding="utf-8-sig")
+
     morning_watch.to_csv("morning_watchlist.csv", index=False, encoding="utf-8-sig")
 
     print("\nCSV出力完了:")
