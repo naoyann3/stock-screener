@@ -8,9 +8,12 @@ MAX_TICKERS = 500
 BATCH_SIZE = 100
 SLEEP_SEC = 0.8
 
-# フィルター
+# 実戦用フィルター
 MIN_TURNOVER = 50_000_000   # 5000万円
 MIN_VOLUME = 200_000        # 20万株
+
+# 監視上位に残したい最低限の引け位置
+MIN_CLOSE_POSITION_FOR_WATCH = 35.0
 
 
 def load_tickers(csv_path=TICKERS_CSV, max_tickers=MAX_TICKERS):
@@ -44,8 +47,7 @@ def fetch_data(ticker, period="6mo", interval="1d"):
             if c not in df.columns:
                 return None
 
-        df = df[need_cols].copy()
-        df = df.dropna()
+        df = df[need_cols].copy().dropna()
 
         if len(df) < 40:
             return None
@@ -62,6 +64,10 @@ def calc_indicators(df):
     # 移動平均
     df["ma5"] = df["Close"].rolling(5).mean()
     df["ma25"] = df["Close"].rolling(25).mean()
+
+    # 移動平均の向き
+    df["ma5_slope"] = df["ma5"] - df["ma5"].shift(1)
+    df["ma25_slope"] = df["ma25"] - df["ma25"].shift(1)
 
     # 出来高平均
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
@@ -111,43 +117,46 @@ def calc_indicators(df):
         (df["recent_high_5"] - df["Close"]) / df["Close"] * 100
     )
 
-    # 5日高値にかなり近いか（2%以内なら1）
+    # 5日高値にかなり近いか（2%以内）
     df["near_breakout_5"] = (df["breakout_gap_pct_5"] <= 2.0).astype(int)
 
     # 売買代金
     df["turnover"] = df["Close"] * df["Volume"]
     df["turnover_million"] = df["turnover"] / 1_000_000
 
-    # ===== 新ロジック =====
-
-    # 決算前資金流入っぽい動き
-    # 直近3日平均出来高 > 20日平均出来高
+    # 決算前・イベント前っぽい動き
     df["event_volume_flag"] = (df["vol_avg3"] > df["vol_avg20"]).astype(int)
-
-    # 5日騰落率が +5%〜+20% の範囲
     df["event_price_flag"] = (
         (df["change_5d_pct"] >= 5) & (df["change_5d_pct"] <= 20)
     ).astype(int)
-
-    # 決算前っぽい資金流入（推定）
     df["event_pre_earnings_like"] = (
         (df["event_volume_flag"] == 1) & (df["event_price_flag"] == 1)
     ).astype(int)
 
-    # 吸収型上昇（出来高は増えているのに価格変動は小さい）
-    # → 大口が静かに拾っている可能性
+    # 吸収型上昇（大口が静かに拾う形）
     df["smart_money_absorb"] = (
         (df["volume_ratio"] >= 3.0) &
         (df["prev_change_pct"].abs() <= 3.0) &
         (df["day_range_pct"] <= 6.0)
     ).astype(int)
 
-    # 緩め版スマートマネー
+    # 緩め版
     df["smart_money_absorb_loose"] = (
         (df["vol_accel_3"] >= 1.8) &
         (df["change_5d_pct"] >= 0) &
         (df["change_5d_pct"] <= 8) &
         (df["day_range_pct"] <= 8)
+    ).astype(int)
+
+    # センターピンに近い強シグナル
+    df["core_signal"] = (
+        (df["volume_ratio"] >= 1.8) &
+        (df["vol_accel_3"] >= 1.3) &
+        (df["close_position_pct"] >= 50) &
+        (
+            (df["near_breakout_5"] == 1) |
+            (df["resistance_gap_pct"] <= 5)
+        )
     ).astype(int)
 
     return df
@@ -166,53 +175,67 @@ def classify_row(row):
 def score_row(row, category):
     score = 0.0
 
-    # 出来高系
+    # ===== センターピン =====
+
+    # 出来高倍率
     score += min(row.get("volume_ratio", 0), 10) * 2.0
-    score += min(row.get("vol_accel_3", 0), 5) * 1.5
+
+    # 出来高加速
+    score += min(row.get("vol_accel_3", 0), 5) * 1.8
+
+    # ブレイク接近
+    score += row.get("near_breakout_5", 0) * 3.0
+    if row.get("resistance_gap_pct", 999) <= 5:
+        score += 1.8
+
+    # 引け位置（最重要補助）
+    close_pos = row.get("close_position_pct", 0)
+    if close_pos >= 80:
+        score += 3.0
+    elif close_pos >= 65:
+        score += 2.0
+    elif close_pos >= 50:
+        score += 1.0
+    elif close_pos < 25:
+        score -= 2.0
+
+    # ===== 補助 =====
 
     # 5日線乖離
     ma5_gap = row.get("ma5_gap_pct", 0)
-    if 0 <= ma5_gap <= 15:
-        score += ma5_gap * 0.6
-    elif ma5_gap > 15:
-        score += max(0, 15 * 0.6 - (ma5_gap - 15) * 0.8)
+    if 0 <= ma5_gap <= 12:
+        score += ma5_gap * 0.5
+    elif ma5_gap > 12:
+        score += max(0, 12 * 0.5 - (ma5_gap - 12) * 0.8)
 
     # 前日比
     prev_chg = row.get("prev_change_pct", 0)
-    if 0 <= prev_chg <= 15:
-        score += prev_chg * 0.5
-    elif prev_chg > 15:
-        score += max(0, 15 * 0.5 - (prev_chg - 15) * 0.7)
+    if 0 <= prev_chg <= 12:
+        score += prev_chg * 0.35
+    elif prev_chg > 12:
+        score += max(0, 12 * 0.35 - (prev_chg - 12) * 0.8)
+    elif prev_chg < -6:
+        score -= 1.5
 
     # 5日騰落率
     chg5 = row.get("change_5d_pct", 0)
-    if 3 <= chg5 <= 20:
-        score += 2.0
+    if 3 <= chg5 <= 18:
+        score += 1.8
     elif chg5 > 25:
-        score -= 1.5
-
-    # 引け位置
-    close_pos = row.get("close_position_pct", 0)
-    if close_pos >= 70:
-        score += 2.5
-    elif close_pos >= 50:
-        score += 1.0
-    else:
-        score -= 1.0
+        score -= 2.0
 
     # 値幅
     day_range = row.get("day_range_pct", 0)
     if 3 <= day_range <= 12:
-        score += 1.5
+        score += 1.2
     elif day_range > 20:
-        score -= 1.0
+        score -= 1.2
 
-    # 20日高値まで近いなら加点
-    if row.get("resistance_gap_pct", 999) <= 5:
-        score += 1.5
-
-    # 5日高値ブレイク直前
-    score += row.get("near_breakout_5", 0) * 2.0
+    # 移動平均の向き
+    if row.get("ma5_slope", 0) > 0:
+        score += 1.0
+    if row.get("ma25_slope", 0) > 0:
+        score += 0.8
 
     # 売買代金
     turnover_m = row.get("turnover_million", 0)
@@ -223,20 +246,21 @@ def score_row(row, category):
     elif turnover_m >= 100:       # 1億円以上
         score += 0.8
 
-    # ===== 新ロジック加点 =====
+    # 決算前・イベント前っぽい
+    score += row.get("event_pre_earnings_like", 0) * 1.5
 
-    # 決算前っぽい資金流入
-    score += row.get("event_pre_earnings_like", 0) * 2.5
+    # 吸収型
+    score += row.get("smart_money_absorb", 0) * 2.2
+    score += row.get("smart_money_absorb_loose", 0) * 1.0
 
-    # スマートマネー吸収型
-    score += row.get("smart_money_absorb", 0) * 3.0
-    score += row.get("smart_money_absorb_loose", 0) * 1.5
+    # コアシグナル
+    score += row.get("core_signal", 0) * 3.0
 
     # カテゴリ補正
     if category == "low":
-        score += 1.0
+        score += 0.8
     elif category == "large":
-        score -= 0.5
+        score -= 0.3
 
     return round(score, 2)
 
@@ -248,6 +272,8 @@ def build_row_data(ticker, name, latest):
         "close": round(float(latest["Close"]), 3),
         "ma5": round(float(latest["ma5"]), 3),
         "ma25": round(float(latest["ma25"]), 3),
+        "ma5_slope": round(float(latest["ma5_slope"]), 6),
+        "ma25_slope": round(float(latest["ma25_slope"]), 6),
         "volume": int(latest["Volume"]),
         "vol_avg20": round(float(latest["vol_avg20"]), 3),
         "vol_avg10": round(float(latest["vol_avg10"]), 3),
@@ -269,6 +295,7 @@ def build_row_data(ticker, name, latest):
         "event_pre_earnings_like": int(latest["event_pre_earnings_like"]),
         "smart_money_absorb": int(latest["smart_money_absorb"]),
         "smart_money_absorb_loose": int(latest["smart_money_absorb_loose"]),
+        "core_signal": int(latest["core_signal"]),
     }
 
 
@@ -299,7 +326,8 @@ def run():
             latest = hist.iloc[-1]
 
             required_cols = [
-                "ma5", "ma25", "vol_avg20", "vol_avg10", "vol_avg3",
+                "ma5", "ma25", "ma5_slope", "ma25_slope",
+                "vol_avg20", "vol_avg10", "vol_avg3",
                 "volume_ratio", "vol_accel_3",
                 "ma5_gap_pct", "prev_change_pct", "change_5d_pct",
                 "day_range_pct", "close_position_pct",
@@ -309,17 +337,17 @@ def run():
                 "event_pre_earnings_like",
                 "smart_money_absorb",
                 "smart_money_absorb_loose",
+                "core_signal",
             ]
             if latest[required_cols].isna().any():
                 continue
 
             row_data = build_row_data(ticker, name, latest)
 
-            # 売買代金フィルター
+            # 実戦フィルター
             if row_data["turnover"] < MIN_TURNOVER:
                 continue
 
-            # 出来高の絶対値フィルター
             if row_data["volume"] < MIN_VOLUME:
                 continue
 
@@ -372,6 +400,7 @@ def run():
         "event_pre_earnings_like",
         "smart_money_absorb",
         "smart_money_absorb_loose",
+        "core_signal",
     ]
 
     print("\n==== 大型テーマ株（上位10件）====")
@@ -392,24 +421,33 @@ def run():
     else:
         print("該当なし")
 
-    # 朝の監視ランキング（重複除外）
+    # 重複除外
     all_watch = pd.concat([large_df, mid_df, low_df], ignore_index=True) if (
         not large_df.empty or not mid_df.empty or not low_df.empty
     ) else pd.DataFrame()
 
     if not all_watch.empty:
         all_watch = all_watch.sort_values("score", ascending=False)
-        morning_watch = all_watch.drop_duplicates(subset=["ticker"], keep="first")
+        morning_watch = all_watch.drop_duplicates(subset=["ticker"], keep="first").copy()
+
+        # 引けが弱すぎるものを監視上位から落としやすくする
+        morning_watch = morning_watch[
+            morning_watch["close_position_pct"] >= MIN_CLOSE_POSITION_FOR_WATCH
+        ].copy()
+
         morning_watch = morning_watch.head(10)
 
         print("\n==== 朝の監視ランキング（重複除外）====")
-        print(morning_watch[display_cols].to_string(index=False))
+        if not morning_watch.empty:
+            print(morning_watch[display_cols].to_string(index=False))
+        else:
+            print("該当なし")
     else:
         morning_watch = pd.DataFrame(columns=display_cols)
         print("\n==== 朝の監視ランキング（重複除外）====")
         print("該当なし")
 
-    # CSV出力
+    # CSV
     if not large_df.empty:
         large_df.to_csv("large_caps.csv", index=False, encoding="utf-8-sig")
     else:
