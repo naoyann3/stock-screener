@@ -9,8 +9,10 @@ BATCH_SIZE = 100
 SLEEP_SEC = 0.8
 
 # 売買代金フィルター（円）
-# まずは緩めに 50,000,000 = 5000万円
-MIN_TURNOVER = 50_000_000
+MIN_TURNOVER = 50_000_000   # 5000万円
+
+# 出来高の絶対値フィルター（株）
+MIN_VOLUME = 200_000        # 20万株
 
 
 def load_tickers(csv_path=TICKERS_CSV, max_tickers=MAX_TICKERS):
@@ -32,6 +34,7 @@ def fetch_data(ticker, period="3mo", interval="1d"):
             progress=False,
             threads=False,
         )
+
         if df is None or df.empty or len(df) < 30:
             return None
 
@@ -45,10 +48,12 @@ def fetch_data(ticker, period="3mo", interval="1d"):
 
         df = df[need_cols].copy()
         df = df.dropna()
+
         if len(df) < 30:
             return None
 
         return df
+
     except Exception:
         return None
 
@@ -249,6 +254,10 @@ def run():
 
             # 売買代金フィルター
             if row_data["turnover"] < MIN_TURNOVER:
+                continue
+
+            # 出来高の絶対値フィルター
+            if row_data["volume"] < MIN_VOLUME:
                 continue
 
             is_large, is_mid, is_low = classify_row(row_data)
