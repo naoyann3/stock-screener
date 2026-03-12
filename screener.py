@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 
 TICKERS_CSV = "tickers.csv"
-OUTPUT_CSV = "morning_watchlist.csv"
+OUTPUT_CSV = "morning_watchlist_v3.csv"
 
 MAX_TICKERS = 500
 BATCH_SIZE = 100
@@ -75,14 +75,17 @@ def calc_indicators(df):
         if isinstance(df[c], pd.DataFrame):
             df[c] = df[c].iloc[:, 0]
 
+    # 移動平均
     df["ma5"] = df["Close"].rolling(5).mean()
     df["ma10"] = df["Close"].rolling(10).mean()
     df["ma25"] = df["Close"].rolling(25).mean()
 
+    # 移動平均の傾き
     df["ma5_slope"] = df["ma5"] - df["ma5"].shift(1)
     df["ma10_slope"] = df["ma10"] - df["ma10"].shift(1)
     df["ma25_slope"] = df["ma25"] - df["ma25"].shift(1)
 
+    # 出来高
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
     df["vol_avg5"] = df["Volume"].rolling(5).mean()
     df["vol_avg3"] = df["Volume"].rolling(3).mean()
@@ -93,6 +96,7 @@ def calc_indicators(df):
     prev3 = recent3.shift(3)
     df["vol_accel_3"] = recent3 / prev3
 
+    # 価格変化
     df["ma5_gap_pct"] = (df["Close"] - df["ma5"]) / df["ma5"] * 100
 
     df["prev_close"] = df["Close"].shift(1)
@@ -101,15 +105,25 @@ def calc_indicators(df):
     df["close_5ago"] = df["Close"].shift(5)
     df["change_5d_pct"] = (df["Close"] - df["close_5ago"]) / df["close_5ago"] * 100
 
+    # 当日値幅
     df["day_range_pct"] = (df["High"] - df["Low"]) / df["Low"] * 100
 
+    # 引け位置
     hl_range = (df["High"] - df["Low"]).replace(0, pd.NA)
     df["close_position_pct"] = ((df["Close"] - df["Low"]) / hl_range * 100).fillna(0)
 
-    df["upper_shadow_pct"] = (
-        ((df["High"] - df[["Open", "Close"]].max(axis=1)) / df["Close"]) * 100
+    # ヒゲ・実体
+    df["body_pct"] = (df["Close"] - df["Open"]).abs() / df["Close"] * 100
+
+    df["lower_shadow_pct"] = (
+        (df[["Open", "Close"]].min(axis=1) - df["Low"]) / df["Close"] * 100
     ).fillna(0)
 
+    df["upper_shadow_pct"] = (
+        (df["High"] - df[["Open", "Close"]].max(axis=1)) / df["Close"] * 100
+    ).fillna(0)
+
+    # レジスタンス
     df["recent_high_20"] = df["High"].rolling(20).max()
     df["resistance_gap_pct"] = (df["recent_high_20"] - df["Close"]) / df["Close"] * 100
 
@@ -117,25 +131,29 @@ def calc_indicators(df):
     df["breakout_gap_pct_5"] = (df["recent_high_5"] - df["Close"]) / df["Close"] * 100
     df["near_breakout_5"] = (df["breakout_gap_pct_5"] <= 2.0).astype(int)
 
+    # 売買代金
     df["turnover"] = df["Close"] * df["Volume"]
     df["turnover_million"] = df["turnover"] / 1_000_000
 
+    # 前日出来高
     df["prev_day_volume"] = df["Volume"].shift(1)
     df["prev_day_vol_gt_20d"] = (df["prev_day_volume"] > df["vol_avg20"].shift(1)).astype(int)
     df["prev_day_vol_ratio_20"] = df["prev_day_volume"] / df["vol_avg20"].shift(1)
 
+    # イベント前っぽい形
     df["event_pre_earnings_like"] = (
         (df["vol_avg3"] > df["vol_avg20"]) &
         (df["change_5d_pct"].between(5, 20))
     ).astype(int)
 
+    # スマートマネー吸収
     df["smart_money_absorb"] = (
         (df["volume_ratio"] >= 3.0) &
         (df["prev_change_pct"].abs() <= 3.0) &
         (df["day_range_pct"] <= 6.0)
     ).astype(int)
 
-    # 緩和版：実際に発火しやすくする
+    # 機関仕込み（緩和版）
     df["inst_accumulation"] = (
         (df["prev_day_vol_gt_20d"] == 1) &
         (df["volume_ratio"] >= 1.2) &
@@ -149,7 +167,7 @@ def calc_indicators(df):
         (df["upper_shadow_pct"] <= 45)
     ).astype(int)
 
-    # 強い仕込み：やや緩和
+    # 強い機関仕込み
     df["inst_accumulation_strong"] = (
         (df["prev_day_vol_gt_20d"] == 1) &
         (df["prev_day_vol_ratio_20"] >= 1.5) &
@@ -165,12 +183,46 @@ def calc_indicators(df):
         (df["upper_shadow_pct"] <= 35)
     ).astype(int)
 
+    # 吸収ローソク
+    df["absorption_candle"] = (
+        (df["prev_day_vol_gt_20d"] == 1) &
+        (df["volume_ratio"] >= 1.2) &
+        (df["turnover_million"] >= 200) &
+        (df["Close"] >= df["ma25"]) &
+        (df["ma10_slope"] > 0) &
+        (df["prev_change_pct"].between(-1.5, 6.0)) &
+        (df["day_range_pct"].between(2.0, 8.5)) &
+        (df["body_pct"].between(0.8, 4.5)) &
+        (df["lower_shadow_pct"] >= 1.0) &
+        (df["upper_shadow_pct"] <= 3.5) &
+        (df["close_position_pct"] >= 55)
+    ).astype(int)
+
+    # 強い吸収ローソク
+    df["absorption_candle_strong"] = (
+        (df["prev_day_vol_gt_20d"] == 1) &
+        (df["prev_day_vol_ratio_20"] >= 1.5) &
+        (df["volume_ratio"] >= 1.5) &
+        (df["turnover_million"] >= 300) &
+        (df["Close"] >= df["ma10"]) &
+        (df["ma10_slope"] > 0) &
+        (df["ma25_slope"] >= 0) &
+        (df["prev_change_pct"].between(-1.0, 5.0)) &
+        (df["day_range_pct"].between(2.5, 7.5)) &
+        (df["body_pct"].between(1.0, 4.0)) &
+        (df["lower_shadow_pct"] >= 1.2) &
+        (df["upper_shadow_pct"] <= 2.5) &
+        (df["close_position_pct"] >= 65)
+    ).astype(int)
+
+    # コアシグナル
     df["core_signal"] = (
         (df["volume_ratio"] >= 1.8) &
         (df["vol_accel_3"] >= 1.3) &
         (df["close_position_pct"] >= 50)
     ).astype(int)
 
+    # 過熱
     df["is_overheated"] = (
         (df["ma5_gap_pct"] > 12) |
         (df["prev_change_pct"] > 12) |
@@ -191,11 +243,11 @@ def passes_watch_filter(row):
     if row["close_position_pct"] < MIN_CLOSE_POSITION_FOR_WATCH:
         return False
 
-    # 前日出来高条件は重視
+    # 前日出来高ブレイクは必須
     if row["prev_day_vol_gt_20d"] != 1:
         return False
 
-    # 過熱は完全除外ではなく、超過熱だけ除外
+    # 超過熱のみ除外
     if row["ma5_gap_pct"] > 18:
         return False
 
@@ -215,7 +267,7 @@ def score_row(row):
     liquidity_subscore = 0.0
     penalty_subscore = 0.0
 
-    # 出来高
+    # ===== 出来高 =====
     volume_subscore += min(row["volume_ratio"], 10) * 1.8
     volume_subscore += min(row["vol_accel_3"], 5) * 1.4
 
@@ -228,12 +280,15 @@ def score_row(row):
         elif row["prev_day_vol_ratio_20"] >= 1.3:
             volume_subscore += 1.0
 
-    # トレンド
+    # ===== トレンド =====
     if row["ma5_slope"] > 0:
         trend_subscore += 1.2
     if row["ma10_slope"] > 0:
         trend_subscore += 1.5
     if row["ma25_slope"] > 0:
+        trend_subscore += 0.8
+
+    if row["Close"] >= row["ma25"]:
         trend_subscore += 0.8
 
     if 0 <= row["change_5d_pct"] <= 15:
@@ -246,7 +301,7 @@ def score_row(row):
     elif row["prev_change_pct"] > 12:
         penalty_subscore -= 1.5
 
-    # 形
+    # ===== 形 =====
     if row["near_breakout_5"] == 1:
         structure_subscore += 2.5
 
@@ -272,15 +327,21 @@ def score_row(row):
     elif row["ma5_gap_pct"] > 12:
         penalty_subscore -= (row["ma5_gap_pct"] - 12) * 0.5
 
-    # 機関仕込み
+    # ===== 大口・吸収 =====
     if row["inst_accumulation"] == 1:
-        structure_subscore += 3.0
+        structure_subscore += 4.0
 
     if row["inst_accumulation_strong"] == 1:
-        structure_subscore += 4.5
+        structure_subscore += 5.0
 
     if row["smart_money_absorb"] == 1:
         structure_subscore += 1.8
+
+    if row["absorption_candle"] == 1:
+        structure_subscore += 2.5
+
+    if row["absorption_candle_strong"] == 1:
+        structure_subscore += 4.0
 
     if row["event_pre_earnings_like"] == 1:
         structure_subscore += 1.0
@@ -288,7 +349,7 @@ def score_row(row):
     if row["core_signal"] == 1:
         structure_subscore += 0.8
 
-    # 流動性
+    # ===== 流動性 =====
     if row["turnover_million"] >= 3000:
         liquidity_subscore += 3.0
     elif row["turnover_million"] >= 1000:
@@ -298,7 +359,7 @@ def score_row(row):
     elif row["turnover_million"] >= 200:
         liquidity_subscore += 0.8
 
-    # 過熱
+    # ===== 過熱 =====
     if row["is_overheated"] == 1:
         penalty_subscore -= 2.0
 
@@ -310,7 +371,14 @@ def score_row(row):
         penalty_subscore
     )
 
-    return round(total, 2), round(volume_subscore, 2), round(trend_subscore, 2), round(structure_subscore, 2), round(liquidity_subscore, 2), round(penalty_subscore, 2)
+    return (
+        round(total, 2),
+        round(volume_subscore, 2),
+        round(trend_subscore, 2),
+        round(structure_subscore, 2),
+        round(liquidity_subscore, 2),
+        round(penalty_subscore, 2),
+    )
 
 
 def add_entry_priority(df):
@@ -318,14 +386,17 @@ def add_entry_priority(df):
     df["raw_rank"] = df.index + 1
     df["entry_priority_score"] = df["score"]
 
+    # 上位過熱補正
     df.loc[df["raw_rank"] == 1, "entry_priority_score"] -= 1.5
     df.loc[df["raw_rank"] == 2, "entry_priority_score"] += 1.8
     df.loc[df["raw_rank"] == 3, "entry_priority_score"] += 1.2
     df.loc[df["raw_rank"].between(4, 5), "entry_priority_score"] += 0.8
 
-    # 仕込み検知があれば優遇
+    # 仕込み・吸収を優遇
     df.loc[df["inst_accumulation"] == 1, "entry_priority_score"] += 1.5
     df.loc[df["inst_accumulation_strong"] == 1, "entry_priority_score"] += 2.0
+    df.loc[df["absorption_candle"] == 1, "entry_priority_score"] += 1.2
+    df.loc[df["absorption_candle_strong"] == 1, "entry_priority_score"] += 1.8
 
     # 過熱は減点
     df.loc[df["is_overheated"] == 1, "entry_priority_score"] -= 1.5
@@ -371,12 +442,16 @@ def run():
             "prev_day_vol_ratio_20": round(float(latest["prev_day_vol_ratio_20"]), 6) if pd.notna(latest["prev_day_vol_ratio_20"]) else None,
             "close_position_pct": round(float(latest["close_position_pct"]), 6),
             "upper_shadow_pct": round(float(latest["upper_shadow_pct"]), 6),
+            "lower_shadow_pct": round(float(latest["lower_shadow_pct"]), 6),
+            "body_pct": round(float(latest["body_pct"]), 6),
             "near_breakout_5": int(latest["near_breakout_5"]),
             "event_pre_earnings_like": int(latest["event_pre_earnings_like"]),
             "core_signal": int(latest["core_signal"]),
             "smart_money_absorb": int(latest["smart_money_absorb"]),
             "inst_accumulation": int(latest["inst_accumulation"]),
             "inst_accumulation_strong": int(latest["inst_accumulation_strong"]),
+            "absorption_candle": int(latest["absorption_candle"]),
+            "absorption_candle_strong": int(latest["absorption_candle_strong"]),
             "is_overheated": int(latest["is_overheated"]),
             "prev_change_pct": round(float(latest["prev_change_pct"]), 6),
             "change_5d_pct": round(float(latest["change_5d_pct"]), 6),
@@ -427,12 +502,16 @@ def run():
         "vol_accel_3",
         "close_position_pct",
         "upper_shadow_pct",
+        "lower_shadow_pct",
+        "body_pct",
         "near_breakout_5",
         "event_pre_earnings_like",
         "core_signal",
         "smart_money_absorb",
         "inst_accumulation",
         "inst_accumulation_strong",
+        "absorption_candle",
+        "absorption_candle_strong",
         "is_overheated",
         "prev_change_pct",
         "change_5d_pct",
