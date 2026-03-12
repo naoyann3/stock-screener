@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 
 TICKERS_CSV = "tickers.csv"
-OUTPUT_CSV = "morning_watchlist_v3.csv"
+OUTPUT_CSV = "morning_watchlist.csv"
 
 MAX_TICKERS = 500
 BATCH_SIZE = 100
