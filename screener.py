@@ -1,9 +1,14 @@
 import time
+from datetime import datetime
 import pandas as pd
 import yfinance as yf
+from pathlib import Path
+
+from config import WATCHLISTS_DIR, SCREEN_VERSION, ensure_results_dirs
 
 TICKERS_CSV = "tickers.csv"
 OUTPUT_CSV = "morning_watchlist.csv"
+UNIVERSE_OFFSET_FILE = "universe_offset.txt"
 
 MAX_TICKERS = 500
 BATCH_SIZE = 100
@@ -13,17 +18,55 @@ TOP_N_OUTPUT = 80
 MIN_TURNOVER = 50_000_000
 MIN_VOLUME = 200_000
 MIN_CLOSE_POSITION_FOR_WATCH = 35.0
+MIN_VOLUME_RATIO_FOR_WATCH = 0.9
+MIN_VOL_ACCEL_3_FOR_WATCH = 1.0
+MIN_VOL_ACCEL_3_FOR_LOW_VOLUME_RATIO = 1.15
+MIN_CLOSE_POSITION_FOR_LOW_VOLUME_RATIO = 50.0
+MAX_BREAKOUT_GAP_PCT_5 = 1.0
+MAX_RESISTANCE_GAP_PCT_FOR_BREAKOUT = 3.0
+ALLOW_OVERHEATED_WITH_SIGNAL_ONLY = True
+
+
+def _offset_path():
+    return Path(__file__).resolve().parent / UNIVERSE_OFFSET_FILE
+
+
+def _ticker_path():
+    return Path(__file__).resolve().parent / TICKERS_CSV
+
+
+def _latest_output_path():
+    return Path(__file__).resolve().parent / OUTPUT_CSV
+
+
+def load_universe_offset():
+    path = _offset_path()
+    try:
+        return int(path.read_text(encoding="utf-8").strip() or "0")
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def save_universe_offset(offset):
+    _offset_path().write_text(str(offset), encoding="utf-8")
 
 
 def load_tickers():
-    df = pd.read_csv(TICKERS_CSV)
+    df = pd.read_csv(_ticker_path())
     df = df.dropna(subset=["ticker"])
     df["ticker"] = df["ticker"].astype(str).str.strip()
 
     if "name" not in df.columns:
         df["name"] = df["ticker"]
 
-    return df.head(MAX_TICKERS)
+    if df.empty or len(df) <= MAX_TICKERS:
+        return df.reset_index(drop=True), 0
+
+    offset = load_universe_offset() % len(df)
+    rotated = pd.concat([df.iloc[offset:], df.iloc[:offset]], ignore_index=True)
+    next_offset = (offset + MAX_TICKERS) % len(df)
+    save_universe_offset(next_offset)
+    return rotated.head(MAX_TICKERS).reset_index(drop=True), offset
 
 
 def fetch_data(ticker):
@@ -34,7 +77,7 @@ def fetch_data(ticker):
             interval="1d",
             progress=False,
             threads=False,
-            auto_adjust=False,
+            auto_adjust=True,
             group_by="column",
         )
 
@@ -81,9 +124,9 @@ def calc_indicators(df):
     df["ma25"] = df["Close"].rolling(25).mean()
 
     # 移動平均の傾き
-    df["ma5_slope"] = df["ma5"] - df["ma5"].shift(1)
-    df["ma10_slope"] = df["ma10"] - df["ma10"].shift(1)
-    df["ma25_slope"] = df["ma25"] - df["ma25"].shift(1)
+    df["ma5_slope"] = (df["ma5"] - df["ma5"].shift(1)) / df["ma5"].shift(1) * 100
+    df["ma10_slope"] = (df["ma10"] - df["ma10"].shift(1)) / df["ma10"].shift(1) * 100
+    df["ma25_slope"] = (df["ma25"] - df["ma25"].shift(1)) / df["ma25"].shift(1) * 100
 
     # 出来高
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
@@ -124,12 +167,15 @@ def calc_indicators(df):
     ).fillna(0)
 
     # レジスタンス
-    df["recent_high_20"] = df["High"].rolling(20).max()
+    df["recent_high_20"] = df["High"].shift(1).rolling(20).max()
     df["resistance_gap_pct"] = (df["recent_high_20"] - df["Close"]) / df["Close"] * 100
 
-    df["recent_high_5"] = df["High"].rolling(5).max()
+    df["recent_high_5"] = df["High"].shift(1).rolling(5).max()
     df["breakout_gap_pct_5"] = (df["recent_high_5"] - df["Close"]) / df["Close"] * 100
-    df["near_breakout_5"] = (df["breakout_gap_pct_5"] <= 2.0).astype(int)
+    df["near_breakout_5"] = (
+        (df["breakout_gap_pct_5"] <= MAX_BREAKOUT_GAP_PCT_5) &
+        (df["resistance_gap_pct"] <= MAX_RESISTANCE_GAP_PCT_FOR_BREAKOUT)
+    ).astype(int)
 
     # 売買代金
     df["turnover"] = df["Close"] * df["Volume"]
@@ -247,6 +293,51 @@ def passes_watch_filter(row):
     if row["prev_day_vol_gt_20d"] != 1:
         return False
 
+    # 短期モメンタムの方向性は維持したい
+    if row["change_5d_pct"] < 0:
+        return False
+
+    # 当日もある程度の出来高フォローは欲しい
+    if (
+        row["volume_ratio"] < MIN_VOLUME_RATIO_FOR_WATCH and
+        row["vol_accel_3"] < MIN_VOL_ACCEL_3_FOR_WATCH
+    ):
+        return False
+
+    if row["volume_ratio"] < MIN_VOLUME_RATIO_FOR_WATCH:
+        if row["vol_accel_3"] < MIN_VOL_ACCEL_3_FOR_LOW_VOLUME_RATIO:
+            return False
+        if row["close_position_pct"] < MIN_CLOSE_POSITION_FOR_LOW_VOLUME_RATIO:
+            return False
+
+    if row["event_pre_earnings_like"] == 1:
+        has_supportive_signal = any(
+            row[col] == 1
+            for col in (
+                "inst_accumulation",
+                "inst_accumulation_strong",
+                "absorption_candle",
+                "absorption_candle_strong",
+                "core_signal",
+            )
+        )
+        if not has_supportive_signal:
+            return False
+
+    # 過熱銘柄は、吸収や仕込みの裏付けが弱いなら除外
+    if ALLOW_OVERHEATED_WITH_SIGNAL_ONLY and row["is_overheated"] == 1:
+        has_supportive_signal = any(
+            row[col] == 1
+            for col in (
+                "inst_accumulation",
+                "inst_accumulation_strong",
+                "absorption_candle",
+                "absorption_candle_strong",
+            )
+        )
+        if not has_supportive_signal:
+            return False
+
     # 超過熱のみ除外
     if row["ma5_gap_pct"] > 18:
         return False
@@ -303,7 +394,7 @@ def score_row(row):
 
     # ===== 形 =====
     if row["near_breakout_5"] == 1:
-        structure_subscore += 2.5
+        structure_subscore += 2.0
 
     if row["resistance_gap_pct"] <= 5:
         structure_subscore += 1.5
@@ -329,22 +420,22 @@ def score_row(row):
 
     # ===== 大口・吸収 =====
     if row["inst_accumulation"] == 1:
-        structure_subscore += 4.0
+        structure_subscore += 4.8
 
     if row["inst_accumulation_strong"] == 1:
-        structure_subscore += 5.0
+        structure_subscore += 5.8
 
     if row["smart_money_absorb"] == 1:
         structure_subscore += 1.8
 
     if row["absorption_candle"] == 1:
-        structure_subscore += 2.5
+        structure_subscore += 3.6
 
     if row["absorption_candle_strong"] == 1:
-        structure_subscore += 4.0
+        structure_subscore += 5.0
 
     if row["event_pre_earnings_like"] == 1:
-        structure_subscore += 1.0
+        penalty_subscore -= 1.2
 
     if row["core_signal"] == 1:
         structure_subscore += 0.8
@@ -361,7 +452,7 @@ def score_row(row):
 
     # ===== 過熱 =====
     if row["is_overheated"] == 1:
-        penalty_subscore -= 2.0
+        penalty_subscore -= 3.5
 
     total = (
         volume_subscore +
@@ -393,13 +484,14 @@ def add_entry_priority(df):
     df.loc[df["raw_rank"].between(4, 5), "entry_priority_score"] += 0.8
 
     # 仕込み・吸収を優遇
-    df.loc[df["inst_accumulation"] == 1, "entry_priority_score"] += 1.5
-    df.loc[df["inst_accumulation_strong"] == 1, "entry_priority_score"] += 2.0
-    df.loc[df["absorption_candle"] == 1, "entry_priority_score"] += 1.2
-    df.loc[df["absorption_candle_strong"] == 1, "entry_priority_score"] += 1.8
+    df.loc[df["inst_accumulation"] == 1, "entry_priority_score"] += 2.0
+    df.loc[df["inst_accumulation_strong"] == 1, "entry_priority_score"] += 2.6
+    df.loc[df["absorption_candle"] == 1, "entry_priority_score"] += 2.0
+    df.loc[df["absorption_candle_strong"] == 1, "entry_priority_score"] += 2.8
 
-    # 過熱は減点
-    df.loc[df["is_overheated"] == 1, "entry_priority_score"] -= 1.5
+    # 過熱とイベント先行感は減点
+    df.loc[df["is_overheated"] == 1, "entry_priority_score"] -= 3.0
+    df.loc[df["event_pre_earnings_like"] == 1, "entry_priority_score"] -= 1.5
 
     df = df.sort_values("entry_priority_score", ascending=False).reset_index(drop=True)
     df["entry_rank"] = range(1, len(df) + 1)
@@ -407,9 +499,12 @@ def add_entry_priority(df):
 
 
 def run():
-    tickers = load_tickers()
+    ensure_results_dirs()
+    tickers, universe_offset = load_tickers()
     rows = []
     total = len(tickers)
+    screen_date = None
+    generated_at = datetime.now().isoformat(timespec="seconds")
 
     for i, r in tickers.iterrows():
         ticker = r["ticker"]
@@ -422,14 +517,21 @@ def run():
             continue
 
         hist = calc_indicators(hist)
-        latest = hist.iloc[-1]
+        latest = hist.iloc[-2]
+        latest_date = pd.Timestamp(hist.index[-2]).date()
 
         if not passes_watch_filter(latest):
             continue
 
+        screen_date = latest_date if screen_date is None else max(screen_date, latest_date)
+
         score, volume_sub, trend_sub, structure_sub, liquidity_sub, penalty_sub = score_row(latest)
 
         row = {
+            "run_date": latest_date.isoformat(),
+            "screen_version": SCREEN_VERSION,
+            "universe_offset": universe_offset,
+            "generated_at": generated_at,
             "ticker": ticker,
             "name": name,
             "close": round(float(latest["Close"]), 3),
@@ -481,6 +583,10 @@ def run():
     df = add_entry_priority(df)
 
     watch_cols = [
+        "run_date",
+        "screen_version",
+        "universe_offset",
+        "generated_at",
         "raw_rank",
         "entry_priority_score",
         "entry_rank",
@@ -525,11 +631,18 @@ def run():
 
     output_df = df[watch_cols].head(TOP_N_OUTPUT).copy()
 
+    if screen_date is None:
+        screen_date = pd.Timestamp(output_df["run_date"].max()).date()
+
     print("\n==== Morning Watchlist v3 ====")
     print(output_df.to_string(index=False))
 
-    output_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"\nCSV出力完了: {OUTPUT_CSV}")
+    latest_output_path = _latest_output_path()
+    dated_output_path = WATCHLISTS_DIR / f"{screen_date.isoformat()}_{SCREEN_VERSION}.csv"
+    output_df.to_csv(latest_output_path, index=False, encoding="utf-8-sig")
+    output_df.to_csv(dated_output_path, index=False, encoding="utf-8-sig")
+    print(f"\nCSV出力完了: {latest_output_path.name}")
+    print(f"履歴保存完了: {dated_output_path}")
 
 
 if __name__ == "__main__":
