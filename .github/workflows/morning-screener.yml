@@ -41,8 +41,5 @@ jobs:
         with:
           name: screener-results-${{ env.RUN_DATE }}
           path: |
-            large_caps.csv
-            mid_caps.csv
-            low_price.csv
             morning_watchlist.csv
             history/*.csv
