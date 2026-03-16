@@ -1,10 +1,17 @@
 import time
 from datetime import datetime
-import pandas as pd
-import yfinance as yf
 from pathlib import Path
 
-from config import WATCHLISTS_DIR, SCREEN_VERSION, ensure_results_dirs
+import pandas as pd
+import yfinance as yf
+
+BASE_DIR = Path(__file__).resolve().parent
+WATCHLISTS_DIR = BASE_DIR / "history"
+SCREEN_VERSION = "v3"
+
+
+def ensure_results_dirs():
+    WATCHLISTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TICKERS_CSV = "tickers.csv"
 OUTPUT_CSV = "morning_watchlist.csv"
